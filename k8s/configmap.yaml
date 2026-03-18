@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-triage-config
+  labels:
+    app: log-triage
+data:
+  # Generator rate: lines per second (11667 ≈ 42M/hour).
+  GENERATOR_RATE: "1000"
+  # Server listen address.
+  SERVER_ADDR: ":8080"
+  # Shared log file path.
+  LOG_FILE: "/data/logs/output.log"

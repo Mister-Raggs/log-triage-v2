@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: log-triage
+  labels:
+    app: log-triage
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-triage
+  template:
+    metadata:
+      labels:
+        app: log-triage
+    spec:
+      # Init container generates initial log data before the server starts.
+      initContainers:
+        - name: seed-logs
+          image: log-triage-v2:latest
+          imagePullPolicy: Never  # Use local minikube image.
+          command: ["generator"]
+          args:
+            - "-rate=1000"
+            - "-duration=10s"
+            - "-output=/data/logs/output.log"
+          volumeMounts:
+            - name: log-data
+              mountPath: /data/logs
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+      containers:
+        # Log generator sidecar — continuously appends logs.
+        - name: generator
+          image: log-triage-v2:latest
+          imagePullPolicy: Never
+          command: ["generator"]
+          args:
+            - "-rate=1000"
+            - "-output=/data/logs/output.log"
+          envFrom:
+            - configMapRef:
+                name: log-triage-config
+          volumeMounts:
+            - name: log-data
+              mountPath: /data/logs
+          resources:
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+        # Query server — reads logs and serves the API.
+        - name: server
+          image: log-triage-v2:latest
+          imagePullPolicy: Never
+          command: ["server"]
+          args:
+            - "-addr=:8080"
+            - "-log-file=/data/logs/output.log"
+          envFrom:
+            - configMapRef:
+                name: log-triage-config
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          volumeMounts:
+            - name: log-data
+              mountPath: /data/logs
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+      volumes:
+        - name: log-data
+          emptyDir: {}
