@@ -10,6 +10,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -135,21 +136,33 @@ func main() {
 		}
 	}()
 
-	// Optional deadline.
-	var deadline <-chan time.Time
+	// Optional deadline via context — ensures the loop exits cleanly and
+	// deferred flushes run even if duration elapses mid-sleep.
+	ctx := context.Background()
+	var cancel context.CancelFunc
 	if *duration > 0 {
-		deadline = time.After(*duration)
+		ctx, cancel = context.WithTimeout(ctx, *duration)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
 	}
+	defer cancel()
+
+	// Forward OS signals into context cancellation.
+	go func() {
+		<-stop
+		logger.Info("generator stopped by signal", zap.Int64("total_lines", totalLines.Load()))
+		cancel()
+	}()
+
+	rateTicker := time.NewTicker(interval)
+	defer rateTicker.Stop()
 
 	for {
 		select {
-		case <-stop:
-			logger.Info("generator stopped by signal", zap.Int64("total_lines", totalLines.Load()))
+		case <-ctx.Done():
+			logger.Info("generator done", zap.Int64("total_lines", totalLines.Load()))
 			return
-		case <-deadline:
-			logger.Info("generator duration elapsed", zap.Int64("total_lines", totalLines.Load()))
-			return
-		default:
+		case <-rateTicker.C:
 		}
 
 		line := generateLine(time.Now())
@@ -158,14 +171,9 @@ func main() {
 		totalLines.Add(1)
 
 		// Flush periodically to keep file readable during generation.
-		if totalLines.Load()%10000 == 0 {
+		if totalLines.Load()%1000 == 0 {
 			_ = w.Flush()
 		}
-
-		// Throttle to target rate. For very high rates this is approximate —
-		// at 42M/hr the ~85ns interval is close to scheduling granularity,
-		// so actual throughput depends on hardware.
-		time.Sleep(interval)
 	}
 }
 

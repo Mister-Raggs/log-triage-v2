@@ -1,6 +1,6 @@
 # Multi-stage build for minimal final image.
 # Stage 1: Build both binaries.
-FROM golang:1.22-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 WORKDIR /app
 
@@ -32,4 +32,4 @@ VOLUME ["/data"]
 
 EXPOSE 8080
 
-ENTRYPOINT ["server"]
+CMD ["server"]
