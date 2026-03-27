@@ -3,3 +3,5 @@
 /bin/
 /data/
 vendor/
+/server
+/generator

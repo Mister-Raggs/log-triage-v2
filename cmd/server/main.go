@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -146,69 +147,88 @@ func main() {
 // ingest reads log lines from a file (or stdin) and inserts them into the index.
 // It batches entries for efficiency and tails the file for new content.
 func ingest(ctx context.Context, logger *zap.Logger, idx *index.Index, path string) {
-	var scanner *bufio.Scanner
-
-	if path != "" {
-		f, err := os.Open(path)
-		if err != nil {
-			logger.Error("failed to open log file", zap.String("path", path), zap.Error(err))
-			return
-		}
-		defer f.Close()
-		scanner = bufio.NewScanner(f)
-	} else {
+	// stdin path: scan until EOF then exit.
+	if path == "" {
 		logger.Info("reading logs from stdin")
-		scanner = bufio.NewScanner(os.Stdin)
+		ingestReader(ctx, logger, idx, os.Stdin)
+		return
 	}
 
-	// Increase scanner buffer for high-throughput ingestion.
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+	// File path: open once, track position, re-seek after EOF to tail new content.
+	f, err := os.Open(path)
+	if err != nil {
+		logger.Error("failed to open log file", zap.String("path", path), zap.Error(err))
+		return
+	}
+	defer f.Close()
 
-	const batchSize = 1000
-	batch := make([]parser.LogEntry, 0, batchSize)
-
+	var offset int64
 	for {
 		select {
 		case <-ctx.Done():
-			// Flush remaining batch before exit.
-			if len(batch) > 0 {
-				idx.InsertBatch(batch)
-				ingestedTotal.Add(float64(len(batch)))
-			}
 			logger.Info("ingestion stopped", zap.Int("index_size", idx.Size()))
 			return
 		default:
 		}
 
-		if !scanner.Scan() {
-			// Flush any remaining batch.
-			if len(batch) > 0 {
-				idx.InsertBatch(batch)
-				ingestedTotal.Add(float64(len(batch)))
-				batch = batch[:0]
-			}
-
-			// If reading a file, poll for new content (tail behavior).
-			if path != "" {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(100 * time.Millisecond):
-					// Re-open and seek to continue reading.
-					// For simplicity, we just sleep and let the scanner
-					// pick up new lines on the next scan.
-					continue
-				}
-			}
-
-			// EOF on stdin means we're done.
-			if err := scanner.Err(); err != nil {
-				logger.Error("scanner error", zap.Error(err))
-			}
+		// Seek to where we left off, then scan until EOF.
+		if _, err := f.Seek(offset, 0); err != nil {
+			logger.Error("seek error", zap.Error(err))
 			return
 		}
 
+		newOffset, n := ingestReader(ctx, logger, idx, f)
+		offset += newOffset
+
+		if n == 0 {
+			// No new lines — wait before polling again.
+			select {
+			case <-ctx.Done():
+				logger.Info("ingestion stopped", zap.Int("index_size", idx.Size()))
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+}
+
+// ingestReader scans lines from r, parses and batches them into idx.
+// Returns (bytes consumed, lines ingested).
+func ingestReader(ctx context.Context, logger *zap.Logger, idx *index.Index, r io.Reader) (int64, int) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+
+	const batchSize = 1000
+	batch := make([]parser.LogEntry, 0, batchSize)
+	var bytesRead int64
+	var linesRead int
+
+	flush := func() {
+		if len(batch) > 0 {
+			idx.InsertBatch(batch)
+			ingestedTotal.Add(float64(len(batch)))
+			batch = batch[:0]
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flush()
+			return bytesRead, linesRead
+		default:
+		}
+
+		if !scanner.Scan() {
+			flush()
+			if err := scanner.Err(); err != nil {
+				logger.Error("scanner error", zap.Error(err))
+			}
+			return bytesRead, linesRead
+		}
+
 		line := scanner.Text()
+		bytesRead += int64(len(line)) + 1 // +1 for newline
 		entry, err := parser.Parse(line)
 		if err != nil {
 			parseErrors.Inc()
@@ -216,11 +236,10 @@ func ingest(ctx context.Context, logger *zap.Logger, idx *index.Index, path stri
 		}
 
 		batch = append(batch, entry)
+		linesRead++
 
 		if len(batch) >= batchSize {
-			idx.InsertBatch(batch)
-			ingestedTotal.Add(float64(len(batch)))
-			batch = batch[:0]
+			flush()
 		}
 	}
 }
