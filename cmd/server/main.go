@@ -69,12 +69,20 @@ var (
 			Help: "Total number of log lines that failed to parse.",
 		},
 	)
+
+	evictionsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "logtriage_evictions_total",
+			Help: "Total number of log entries evicted from the index due to the max-entries cap.",
+		},
+	)
 )
 
 func main() {
 	// --- Configuration ---
-	addr := flag.String("addr", ":8080", "HTTP listen address")
-	logFile := flag.String("log-file", "", "log file to ingest (empty = stdin)")
+	addr       := flag.String("addr", ":8080", "HTTP listen address")
+	logFile    := flag.String("log-file", "", "log file to ingest (empty = stdin)")
+	maxEntries := flag.Int("max-entries", 0, "max index entries before FIFO eviction (0 = unlimited)")
 	flag.Parse()
 
 	// --- Logger ---
@@ -86,7 +94,15 @@ func main() {
 	defer logger.Sync()
 
 	// --- Index + Query handler ---
-	idx := index.New()
+	var idx *index.Index
+	if *maxEntries > 0 {
+		logger.Info("index capped", zap.Int("max_entries", *maxEntries))
+		idx = index.NewCapped(*maxEntries, func(n int) {
+			evictionsTotal.Add(float64(n))
+		})
+	} else {
+		idx = index.New()
+	}
 	handler := query.NewHandler(idx)
 
 	// Register the index size gauge now that we have the index.
@@ -98,7 +114,7 @@ func main() {
 		func() float64 { return float64(idx.Size()) },
 	)
 
-	prometheus.MustRegister(requestsTotal, requestDuration, indexSize, ingestedTotal, parseErrors)
+	prometheus.MustRegister(requestsTotal, requestDuration, indexSize, ingestedTotal, parseErrors, evictionsTotal)
 
 	// --- Ingestion worker pool ---
 	ctx, cancel := context.WithCancel(context.Background())

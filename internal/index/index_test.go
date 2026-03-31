@@ -208,6 +208,62 @@ func TestNearestN(t *testing.T) {
 	}
 }
 
+func TestEviction_CapEnforced(t *testing.T) {
+	evicted := 0
+	idx := NewCapped(5, func(n int) { evicted += n })
+
+	for i := 0; i < 10; i++ {
+		idx.Insert(entry(i*10, "INFO"))
+	}
+
+	if idx.Size() != 5 {
+		t.Fatalf("size: got %d, want 5", idx.Size())
+	}
+	if evicted != 5 {
+		t.Fatalf("evicted: got %d, want 5", evicted)
+	}
+
+	// Oldest entries should be gone — index should start at +50s.
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	want := baseTime.Add(50 * time.Second)
+	if !idx.entries[0].Timestamp.Equal(want) {
+		t.Errorf("oldest entry: got %v, want %v", idx.entries[0].Timestamp, want)
+	}
+}
+
+func TestEviction_BatchCapEnforced(t *testing.T) {
+	evicted := 0
+	idx := NewCapped(3, func(n int) { evicted += n })
+
+	batch := []parser.LogEntry{
+		entry(10, "INFO"),
+		entry(20, "INFO"),
+		entry(30, "INFO"),
+		entry(40, "INFO"),
+		entry(50, "INFO"),
+	}
+	idx.InsertBatch(batch)
+
+	if idx.Size() != 3 {
+		t.Fatalf("size: got %d, want 3", idx.Size())
+	}
+	if evicted != 2 {
+		t.Fatalf("evicted: got %d, want 2", evicted)
+	}
+}
+
+func TestEviction_NilCallback(t *testing.T) {
+	// Should not panic when onEvict is nil.
+	idx := NewCapped(2, nil)
+	idx.Insert(entry(1, "INFO"))
+	idx.Insert(entry(2, "INFO"))
+	idx.Insert(entry(3, "INFO")) // triggers eviction, nil callback
+	if idx.Size() != 2 {
+		t.Fatalf("size: got %d, want 2", idx.Size())
+	}
+}
+
 func BenchmarkInsert(b *testing.B) {
 	idx := New()
 	for i := 0; i < b.N; i++ {

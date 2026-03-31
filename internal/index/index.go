@@ -18,16 +18,38 @@ import (
 	"github.com/raghavkachroo/log-triage-v2/internal/parser"
 )
 
+// EvictionFunc is called after entries are evicted, with the count removed.
+// Used to increment an external counter (e.g. Prometheus) without coupling
+// the index to any specific metrics library.
+type EvictionFunc func(evicted int)
+
 // Index is a concurrency-safe, time-ordered collection of log entries.
 type Index struct {
-	mu      sync.RWMutex
-	entries []parser.LogEntry
+	mu        sync.RWMutex
+	entries   []parser.LogEntry
+	maxEntries int         // 0 = unlimited
+	onEvict   EvictionFunc // nil = no callback
 }
 
-// New creates an empty Index.
+// New creates an empty Index with no eviction cap.
 func New() *Index {
 	return &Index{
 		entries: make([]parser.LogEntry, 0, 1024),
+	}
+}
+
+// NewCapped creates an Index that evicts the oldest entries (FIFO) once it
+// exceeds maxEntries. onEvict is called with the number of entries removed;
+// pass nil if you don't need the callback.
+//
+// FIFO is the natural eviction strategy for a time-ordered log index: the
+// oldest entries are always at entries[0], so eviction is a cheap slice
+// re-slice with no reordering needed.
+func NewCapped(maxEntries int, onEvict EvictionFunc) *Index {
+	return &Index{
+		entries:    make([]parser.LogEntry, 0, min(maxEntries, 1024)),
+		maxEntries: maxEntries,
+		onEvict:    onEvict,
 	}
 }
 
@@ -37,15 +59,15 @@ func (idx *Index) Insert(entry parser.LogEntry) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	// Find insertion point to maintain sorted order by timestamp.
 	pos := sort.Search(len(idx.entries), func(i int) bool {
 		return idx.entries[i].Timestamp.After(entry.Timestamp)
 	})
 
-	// Insert at position — grow slice and shift elements.
 	idx.entries = append(idx.entries, parser.LogEntry{})
 	copy(idx.entries[pos+1:], idx.entries[pos:])
 	idx.entries[pos] = entry
+
+	idx.evictLocked()
 }
 
 // InsertBatch adds multiple entries. It appends them all, then re-sorts once.
@@ -62,6 +84,22 @@ func (idx *Index) InsertBatch(entries []parser.LogEntry) {
 	sort.Slice(idx.entries, func(i, j int) bool {
 		return idx.entries[i].Timestamp.Before(idx.entries[j].Timestamp)
 	})
+
+	idx.evictLocked()
+}
+
+// evictLocked drops the oldest entries when the index exceeds its cap.
+// Must be called with mu held for writing.
+func (idx *Index) evictLocked() {
+	if idx.maxEntries == 0 || len(idx.entries) <= idx.maxEntries {
+		return
+	}
+	evicted := len(idx.entries) - idx.maxEntries
+	// Entries are sorted by time; oldest are at the front — drop them.
+	idx.entries = idx.entries[evicted:]
+	if idx.onEvict != nil {
+		idx.onEvict(evicted)
+	}
 }
 
 // Nearest finds the log entry closest to the given timestamp.
