@@ -1,7 +1,8 @@
 // Command server runs the log triage HTTP API.
 //
-// It starts a background ingestion goroutine that reads log lines from a file
-// (or stdin) and indexes them, while serving queries over HTTP.
+// It starts a worker pool ingestion pipeline that reads log lines from a file
+// (or stdin), parses them in parallel, and indexes them, while serving queries
+// over HTTP.
 //
 // Endpoints:
 //   - POST /query   — find nearest log entries to a timestamp
@@ -10,12 +11,10 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,7 +24,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/raghavkachroo/log-triage-v2/internal/index"
-	"github.com/raghavkachroo/log-triage-v2/internal/parser"
+	"github.com/raghavkachroo/log-triage-v2/internal/ingestion"
 	"github.com/raghavkachroo/log-triage-v2/internal/query"
 	"go.uber.org/zap"
 )
@@ -101,11 +100,15 @@ func main() {
 
 	prometheus.MustRegister(requestsTotal, requestDuration, indexSize, ingestedTotal, parseErrors)
 
-	// --- Ingestion ---
+	// --- Ingestion worker pool ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go ingest(ctx, logger, idx, *logFile)
+	pool := ingestion.New(idx, &promMetrics{})
+
+	// Pool runs until ctx is cancelled; reader feeds lines into it.
+	go pool.Run(ctx)
+	go runReader(ctx, logger, pool, *logFile)
 
 	// --- HTTP server ---
 	mux := http.NewServeMux()
@@ -144,17 +147,21 @@ func main() {
 	logger.Info("server stopped")
 }
 
-// ingest reads log lines from a file (or stdin) and inserts them into the index.
-// It batches entries for efficiency and tails the file for new content.
-func ingest(ctx context.Context, logger *zap.Logger, idx *index.Index, path string) {
-	// stdin path: scan until EOF then exit.
+// promMetrics adapts the Prometheus counters to the ingestion.Metrics interface.
+type promMetrics struct{}
+
+func (p *promMetrics) IncIngested(n float64) { ingestedTotal.Add(n) }
+func (p *promMetrics) IncParseError()        { parseErrors.Inc() }
+
+// runReader feeds raw log lines into the worker pool.
+// For files it tails new content after EOF; for stdin it exits on EOF.
+func runReader(ctx context.Context, logger *zap.Logger, pool *ingestion.Pool, path string) {
 	if path == "" {
 		logger.Info("reading logs from stdin")
-		ingestReader(ctx, logger, idx, os.Stdin)
+		pool.Feed(ctx, os.Stdin)
 		return
 	}
 
-	// File path: open once, track position, re-seek after EOF to tail new content.
 	f, err := os.Open(path)
 	if err != nil {
 		logger.Error("failed to open log file", zap.String("path", path), zap.Error(err))
@@ -166,80 +173,26 @@ func ingest(ctx context.Context, logger *zap.Logger, idx *index.Index, path stri
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info("ingestion stopped", zap.Int("index_size", idx.Size()))
+			logger.Info("ingestion stopped")
 			return
 		default:
 		}
 
-		// Seek to where we left off, then scan until EOF.
 		if _, err := f.Seek(offset, 0); err != nil {
 			logger.Error("seek error", zap.Error(err))
 			return
 		}
 
-		newOffset, n := ingestReader(ctx, logger, idx, f)
+		newOffset, n := pool.Feed(ctx, f)
 		offset += newOffset
 
 		if n == 0 {
-			// No new lines — wait before polling again.
 			select {
 			case <-ctx.Done():
-				logger.Info("ingestion stopped", zap.Int("index_size", idx.Size()))
+				logger.Info("ingestion stopped")
 				return
 			case <-time.After(100 * time.Millisecond):
 			}
-		}
-	}
-}
-
-// ingestReader scans lines from r, parses and batches them into idx.
-// Returns (bytes consumed, lines ingested).
-func ingestReader(ctx context.Context, logger *zap.Logger, idx *index.Index, r io.Reader) (int64, int) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
-
-	const batchSize = 1000
-	batch := make([]parser.LogEntry, 0, batchSize)
-	var bytesRead int64
-	var linesRead int
-
-	flush := func() {
-		if len(batch) > 0 {
-			idx.InsertBatch(batch)
-			ingestedTotal.Add(float64(len(batch)))
-			batch = batch[:0]
-		}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			flush()
-			return bytesRead, linesRead
-		default:
-		}
-
-		if !scanner.Scan() {
-			flush()
-			if err := scanner.Err(); err != nil {
-				logger.Error("scanner error", zap.Error(err))
-			}
-			return bytesRead, linesRead
-		}
-
-		line := scanner.Text()
-		bytesRead += int64(len(line)) + 1 // +1 for newline
-		entry, err := parser.Parse(line)
-		if err != nil {
-			parseErrors.Inc()
-			continue
-		}
-
-		batch = append(batch, entry)
-		linesRead++
-
-		if len(batch) >= batchSize {
-			flush()
 		}
 	}
 }
