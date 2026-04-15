@@ -27,6 +27,7 @@ import (
 
 	"github.com/raghavkachroo/log-triage-v2/internal/index"
 	"github.com/raghavkachroo/log-triage-v2/internal/parser"
+	"github.com/raghavkachroo/log-triage-v2/internal/wal"
 )
 
 const (
@@ -53,9 +54,10 @@ type Pool struct {
 	metrics Metrics
 	workers int
 	lines   chan string
+	wal     *wal.WAL // nil = WAL disabled
 }
 
-// New creates a Pool with workers = runtime.NumCPU().
+// New creates a Pool with workers = runtime.NumCPU() and no WAL.
 // Call Run to start it.
 func New(idx *index.Index, m Metrics) *Pool {
 	return &Pool{
@@ -66,7 +68,19 @@ func New(idx *index.Index, m Metrics) *Pool {
 	}
 }
 
-// NewWithWorkers creates a Pool with an explicit worker count.
+// NewWithWAL creates a Pool that writes each batch to w before inserting
+// into the index. w may be nil to disable WAL writes.
+func NewWithWAL(idx *index.Index, m Metrics, w *wal.WAL) *Pool {
+	return &Pool{
+		idx:     idx,
+		metrics: m,
+		workers: runtime.NumCPU(),
+		lines:   make(chan string, lineChanCap),
+		wal:     w,
+	}
+}
+
+// NewWithWorkers creates a Pool with an explicit worker count and no WAL.
 // Useful for testing and benchmarking.
 func NewWithWorkers(idx *index.Index, m Metrics, workers int) *Pool {
 	return &Pool{
@@ -118,16 +132,24 @@ func (p *Pool) Feed(ctx context.Context, r io.Reader) (int64, int) {
 }
 
 // work is the per-worker loop: pull lines from the channel, parse them,
-// accumulate a batch, and flush to the index.
+// write to WAL (if enabled), then insert into the index.
+//
+// WAL write happens before index insert — if we crash between the two,
+// replay on next startup recovers the entry.
 func (p *Pool) work() {
 	batch := make([]parser.LogEntry, 0, batchSize)
 
 	flush := func() {
-		if len(batch) > 0 {
-			p.idx.InsertBatch(batch)
-			p.metrics.IncIngested(float64(len(batch)))
-			batch = batch[:0]
+		if len(batch) == 0 {
+			return
 		}
+		// Write-ahead: persist to WAL before mutating the index.
+		if p.wal != nil {
+			_ = p.wal.WriteBatch(batch) // best-effort; index still updated
+		}
+		p.idx.InsertBatch(batch)
+		p.metrics.IncIngested(float64(len(batch)))
+		batch = batch[:0]
 	}
 
 	for line := range p.lines {

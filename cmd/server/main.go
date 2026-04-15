@@ -26,6 +26,7 @@ import (
 	"github.com/raghavkachroo/log-triage-v2/internal/index"
 	"github.com/raghavkachroo/log-triage-v2/internal/ingestion"
 	"github.com/raghavkachroo/log-triage-v2/internal/query"
+	"github.com/raghavkachroo/log-triage-v2/internal/wal"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
@@ -102,6 +103,7 @@ func main() {
 	addr       := flag.String("addr", ":8080", "HTTP listen address")
 	logFile    := flag.String("log-file", "", "log file to ingest (empty = stdin)")
 	maxEntries := flag.Int("max-entries", 0, "max index entries before FIFO eviction (0 = unlimited)")
+	walPath    := flag.String("wal-path", "", "path to write-ahead log file (empty = disabled)")
 	flag.Parse()
 
 	// --- Logger ---
@@ -144,11 +146,31 @@ func main() {
 
 	prometheus.MustRegister(requestsTotal, requestDuration, indexSize, ingestedTotal, parseErrors, evictionsTotal)
 
+	// --- WAL setup ---
+	// Replay existing WAL into the index before accepting traffic, then open
+	// for appending so new entries are durable across restarts.
+	var w *wal.WAL
+	if *walPath != "" {
+		entries, err := wal.Replay(*walPath)
+		if err != nil {
+			logger.Error("wal replay failed", zap.Error(err))
+		} else if len(entries) > 0 {
+			idx.InsertBatch(entries)
+			logger.Info("wal replayed", zap.Int("entries", len(entries)))
+		}
+
+		w, err = wal.Open(*walPath)
+		if err != nil {
+			logger.Fatal("failed to open wal", zap.Error(err))
+		}
+		defer w.Close()
+	}
+
 	// --- Ingestion worker pool ---
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pool := ingestion.New(idx, &promMetrics{})
+	pool := ingestion.NewWithWAL(idx, &promMetrics{}, w)
 
 	// Pool runs until ctx is cancelled; reader feeds lines into it.
 	go pool.Run(ctx)
