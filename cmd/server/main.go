@@ -26,6 +26,10 @@ import (
 	"github.com/raghavkachroo/log-triage-v2/internal/index"
 	"github.com/raghavkachroo/log-triage-v2/internal/ingestion"
 	"github.com/raghavkachroo/log-triage-v2/internal/query"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/zap"
 )
 
@@ -78,6 +82,21 @@ var (
 	)
 )
 
+// initTracer sets up an OTel TracerProvider that writes spans as JSON to stdout.
+// Returns a shutdown function the caller must defer.
+func initTracer() (func(context.Context) error, error) {
+	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+	if err != nil {
+		return nil, err
+	}
+	tp := trace.NewTracerProvider(
+		trace.WithBatcher(exporter),
+		trace.WithSampler(trace.AlwaysSample()),
+	)
+	otel.SetTracerProvider(tp)
+	return tp.Shutdown, nil
+}
+
 func main() {
 	// --- Configuration ---
 	addr       := flag.String("addr", ":8080", "HTTP listen address")
@@ -92,6 +111,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer logger.Sync()
+
+	// --- OTel tracer ---
+	// Spans are exported as JSON to stdout so they appear alongside zap logs.
+	// Swap stdouttrace for an OTLP exporter to send to Jaeger/Tempo in production.
+	shutdownTracer, err := initTracer()
+	if err != nil {
+		logger.Fatal("failed to init tracer", zap.Error(err))
+	}
+	defer shutdownTracer(context.Background())
 
 	// --- Index + Query handler ---
 	var idx *index.Index
@@ -213,7 +241,13 @@ func runReader(ctx context.Context, logger *zap.Logger, pool *ingestion.Pool, pa
 	}
 }
 
+// tracer is the OTel tracer for the query handler.
+// Named after the package so spans appear as "logtriage/query.*" in backends.
+var tracer = otel.Tracer("logtriage/query")
+
 // queryHandler returns an HTTP handler for POST /query.
+// It creates a root span for the full request and child spans for each
+// logical phase: decode → index_lookup → encode.
 func queryHandler(h *query.Handler, logger *zap.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -224,25 +258,47 @@ func queryHandler(h *query.Handler, logger *zap.Logger) http.HandlerFunc {
 			return
 		}
 
+		// Root span for the entire /query request.
+		ctx, span := tracer.Start(r.Context(), "query.request")
+		defer span.End()
+
+		// Span 1: JSON decode
+		_, decodeSpan := tracer.Start(ctx, "query.decode")
 		var req query.Request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			decodeSpan.RecordError(err)
+			decodeSpan.End()
 			requestsTotal.WithLabelValues("query", "400").Inc()
 			http.Error(w, fmt.Sprintf("invalid request: %v", err), http.StatusBadRequest)
 			return
 		}
-
 		if req.Timestamp.IsZero() {
+			decodeSpan.End()
 			requestsTotal.WithLabelValues("query", "400").Inc()
 			http.Error(w, "timestamp is required", http.StatusBadRequest)
 			return
 		}
+		decodeSpan.End()
 
+		// Span 2: index lookup — this is the hot path we're benchmarking.
+		_, lookupSpan := tracer.Start(ctx, "query.index_lookup")
+		lookupSpan.SetAttributes(
+			attribute.String("query.tag", req.Tag),
+			attribute.Int("query.count", req.Count),
+			attribute.Int("index.size", h.IndexSize()),
+		)
 		resp := h.Execute(req)
+		lookupSpan.SetAttributes(attribute.Int("result.total", resp.Total))
+		lookupSpan.End()
 
+		// Span 3: JSON encode
+		_, encodeSpan := tracer.Start(ctx, "query.encode")
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			encodeSpan.RecordError(err)
 			logger.Error("failed to encode response", zap.Error(err))
 		}
+		encodeSpan.End()
 
 		duration := time.Since(start).Seconds()
 		requestsTotal.WithLabelValues("query", "200").Inc()
