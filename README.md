@@ -21,6 +21,7 @@ The original solution (Lambda + Java) fetched logs via internal libraries, found
 | **Observability from day one** | Prometheus metrics (request count, latency histogram, index size) + structured logging via `zap` instead of bolt-on monitoring |
 | **Containerized + K8s-native** | Multi-stage Docker build, Kubernetes manifests with probes and resource limits — fully portable |
 | **Separated concerns** | Ingestion, indexing, query, and analysis are distinct packages with clear interfaces |
+| **Write-ahead log** | Index survives restarts — entries are fsynced to disk in batches and replayed on startup before the server accepts traffic |
 
 ## Architecture
 
@@ -64,6 +65,7 @@ log-triage-v2/
 │   ├── parser/        # Log line parsing: "TIMESTAMP [TAG] BODY" → LogEntry
 │   ├── index/         # Time-sorted in-memory index with binary search + FIFO eviction
 │   ├── ingestion/     # Channel-based worker pool: reader goroutine → N parse workers
+│   ├── wal/           # Write-ahead log: batched fsync, startup replay, crash safety
 │   └── query/         # Request/response types + query execution logic
 ├── k8s/               # Kubernetes manifests (Deployment, Service, ConfigMap)
 ├── Dockerfile         # Multi-stage build → ~15MB final image
@@ -84,13 +86,34 @@ go run ./cmd/server -log-file /tmp/test.log
 # Query for the nearest log to a timestamp
 curl -s -X POST http://localhost:8080/query \
   -H "Content-Type: application/json" \
-  -d '{"timestamp": "2024-01-15T10:30:45.123Z"}' | jq .
+  -d "{\"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" | jq .
 
 # Query with tag filter and multiple results
 curl -s -X POST http://localhost:8080/query \
   -H "Content-Type: application/json" \
-  -d '{"timestamp": "2024-01-15T10:30:45.123Z", "tag": "ERROR", "count": 5}' | jq .
+  -d "{\"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\", \"tag\": \"ERROR\", \"count\": 5}" | jq .
 ```
+
+### Run with WAL (survives restarts)
+
+```bash
+# Generate logs
+go run ./cmd/generator -rate 1000 -duration 30s -output /tmp/test.log
+
+# Start server with WAL enabled
+go run ./cmd/server -log-file /tmp/test.log -wal-path /tmp/triage.wal
+
+# Ctrl+C to stop, then restart — index is recovered from disk before first request
+go run ./cmd/server -log-file /tmp/test.log -wal-path /tmp/triage.wal
+```
+
+On restart you will see:
+```json
+{"msg":"wal replayed","entries":29984}
+{"msg":"server starting","addr":":8080"}
+```
+
+The index is fully populated before the HTTP server starts accepting traffic. The missing ~16 entries (out of 30,000) were in the write buffer when the process stopped — this is the deliberate fsync tradeoff: durability is batched every 1,000 entries or 500ms, whichever comes first.
 
 ### Run with Docker
 
@@ -98,15 +121,18 @@ curl -s -X POST http://localhost:8080/query \
 # Build the image
 docker build -t log-triage-v2 .
 
-# Generate logs and pipe to server
-docker run --rm log-triage-v2 generator -rate 1000 -duration 10s > /tmp/test.log
+# Terminal 1 — generate logs into a host file
+docker run --rm -v /tmp/test.log:/data/output.log log-triage-v2 \
+  generator -rate 1000 -duration 30s -output /data/output.log
+
+# Terminal 2 — start server reading that file
 docker run --rm -p 8080:8080 -v /tmp/test.log:/data/logs/output.log log-triage-v2 \
   server -log-file /data/logs/output.log
 
-# Query
+# Terminal 3 — query
 curl -s -X POST http://localhost:8080/query \
   -H "Content-Type: application/json" \
-  -d '{"timestamp": "2024-01-15T10:30:45.123Z"}' | jq .
+  -d "{\"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)\"}" | jq .
 ```
 
 ### Deploy to Minikube
